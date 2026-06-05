@@ -57,6 +57,18 @@ def stats():
             "ocultas": ocultas, "tonos": tonos, "categorias": categorias}
 
 
+def _fts_query(raw: str) -> str:
+    """Convierte la query del usuario en una FTS5 query segura.
+
+    FTS5 trata `-`, `"`, `(`, `:` como operadores. Si el usuario tipea "942-2"
+    el guión se interpreta como NOT y crashea. Solución: quotear cada token
+    como frase literal y agregar `*` para prefix match.
+    """
+    raw = raw.strip().replace('"', "").replace(":", " ").replace("(", " ").replace(")", " ")
+    tokens = [t for t in raw.split() if t]
+    return " ".join(f'"{t}"*' for t in tokens)
+
+
 def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[str],
            color_target_hsv: tuple[float, float, float] | None,
            tol_h: float, modo_papelera: bool, limit: int = 600) -> list[dict]:
@@ -78,14 +90,25 @@ def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[st
         params.extend(tonos)
 
     if query.strip():
-        ids_fts = [r[0] for r in conn.execute(
-            "SELECT id FROM fotos_fts WHERE fotos_fts MATCH ? LIMIT 2000",
-            (query.strip() + "*",)
-        ).fetchall()]
-        if not ids_fts:
-            return []
-        where.append(f"id IN ({','.join('?' * len(ids_fts))})")
-        params.extend(ids_fts)
+        fts_q = _fts_query(query)
+        if fts_q:
+            try:
+                ids_fts = [r[0] for r in conn.execute(
+                    "SELECT id FROM fotos_fts WHERE fotos_fts MATCH ? LIMIT 2000",
+                    (fts_q,)
+                ).fetchall()]
+            except sqlite3.OperationalError:
+                # caracter raro que ni el quoting salvó — fallback a LIKE sobre name/alt
+                like_q = f"%{query.strip()}%"
+                ids_fts = [r[0] for r in conn.execute(
+                    "SELECT id FROM fotos WHERE name LIKE ? OR alt LIKE ? "
+                    "OR categoria LIKE ? LIMIT 2000",
+                    (like_q, like_q, like_q)
+                ).fetchall()]
+            if not ids_fts:
+                return []
+            where.append(f"id IN ({','.join('?' * len(ids_fts))})")
+            params.extend(ids_fts)
 
     sql = "SELECT * FROM fotos"
     if where:
