@@ -1,12 +1,20 @@
-"""Scrapea las categorías de pewenpisos.com.ar y extrae todas las imágenes de productos.
+"""Scrapea las categorías de pewenpisos.com.ar + cada página de producto.
 
-El sitio usa lazy-load: las URLs reales están en data-src / data-lazy-src / srcset,
-no en src. Filtramos placeholders SVG y logos/íconos chicos.
+El sitio usa lazy-load: las URLs reales están en data-src / data-lazy-src / srcset.
+Filtramos placeholders, logos, promos bancarias y limitamos a <main>.
+
+Flujo:
+  1. Para cada categoría (/pisos-flotantes-clasicos/, etc.):
+     - Scrapeo las imágenes que están directamente en la grid.
+     - Extraigo todos los links a /producto/X/ y los visito en paralelo.
+     - Cada página de producto suele tener 3-5 fotos del mismo material.
+  2. Dedup global por URL final (sin el sufijo -WxH de WordPress).
 """
 from __future__ import annotations
 
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -18,13 +26,14 @@ LAZY_ATTRS = ("data-src", "data-lazy-src", "data-original", "data-bg", "data-src
 EXCLUDE_PATTERNS = (
     "logo", "icon", "favicon", "placeholder",
     "whatsapp", "instagram", "facebook", "wp-includes",
-    # promos bancarias / sliders del WP — no son productos
     "promo", "promocion", "hipotecario", "estrellas", "naranja-",
     "mipyme", "bnaconecta", "pymenacion", "agronacion", "payway",
     "mercadopago", "banco-", "tarjeta-", "cuotas-",
 )
 MIN_DIM = 200
 MAIN_SELECTORS = ("main", "#content", "article")
+PRODUCT_LINK_RE = re.compile(r"/producto/[a-z0-9\-]+/?$", re.I)
+WORKERS_PRODUCTOS = 16
 
 
 def _es_pewen(url: str) -> bool:
@@ -50,7 +59,6 @@ def _es_excluida(url: str) -> bool:
 
 
 def _extraer_dims_wp(url: str) -> tuple[int | None, int | None]:
-    """WordPress sufija las imágenes redimensionadas con -WxH.jpg. Extraemos eso."""
     m = re.search(r"-(\d{2,4})x(\d{2,4})\.(jpg|jpeg|png|webp)", url, re.I)
     if m:
         return int(m.group(1)), int(m.group(2))
@@ -58,8 +66,6 @@ def _extraer_dims_wp(url: str) -> tuple[int | None, int | None]:
 
 
 def _normalizar_url_imagen(url: str) -> str:
-    """Saca el sufijo -WxH para quedarnos con la versión original (más grande)
-    y colapsa // duplicados del path."""
     url = re.sub(r"-(\d{2,4})x(\d{2,4})(\.(jpg|jpeg|png|webp))", r"\3", url, flags=re.I)
     url = re.sub(r"(?<!:)//+", "/", url)
     return url
@@ -69,33 +75,37 @@ def _primera_url_srcset(srcset: str) -> str | None:
     if not srcset:
         return None
     candidatos = [c.strip().split()[0] for c in srcset.split(",") if c.strip()]
-    return candidatos[-1] if candidatos else None  # último suele ser el más grande
+    return candidatos[-1] if candidatos else None
 
 
-def scrapear_categoria(path: str) -> list[dict]:
-    """Devuelve lista de dicts con keys: url, alt, title, categoria, src_page."""
-    url = urljoin(SITE_BASE, path)
+def _slug_a_nombre(path: str) -> str:
+    s = path.strip("/").replace("-", " ")
+    return s[:1].upper() + s[1:] if s else ""
+
+
+def _fetch_soup(url: str) -> BeautifulSoup | None:
     try:
         r = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            print(f"[scraper] {url} -> HTTP {r.status_code}", file=sys.stderr)
-            return []
     except Exception as e:
         print(f"[scraper] error {url}: {e}", file=sys.stderr)
-        return []
+        return None
+    if r.status_code != 200:
+        print(f"[scraper] {url} -> HTTP {r.status_code}", file=sys.stderr)
+        return None
+    return BeautifulSoup(r.text, "lxml")
 
-    soup = BeautifulSoup(r.text, "lxml")
-    categoria = _slug_a_nombre(path)
-    encontradas: dict[str, dict] = {}
 
-    raiz = None
+def _raiz_main(soup: BeautifulSoup):
     for sel in MAIN_SELECTORS:
         raiz = soup.select_one(sel)
         if raiz:
-            break
-    if raiz is None:
-        raiz = soup
+            return raiz
+    return soup
 
+
+def _imgs_de_soup(raiz, page_url: str, categoria: str) -> dict[str, dict]:
+    """Extrae el dict {url_normalizada: row} de un fragmento HTML."""
+    encontradas: dict[str, dict] = {}
     for img in raiz.find_all("img"):
         candidatos = []
 
@@ -117,7 +127,7 @@ def scrapear_categoria(path: str) -> list[dict]:
                 candidatos.append(primera)
 
         for raw in candidatos:
-            full = urljoin(url, raw.strip())
+            full = urljoin(page_url, raw.strip())
             if not _es_imagen(full):
                 continue
             if not _es_pewen(full):
@@ -140,15 +150,56 @@ def scrapear_categoria(path: str) -> list[dict]:
                 "alt": alt,
                 "title": title,
                 "categoria": categoria,
-                "src_page": url,
+                "src_page": page_url,
             }
 
-    return list(encontradas.values())
+    return encontradas
 
 
-def _slug_a_nombre(path: str) -> str:
-    s = path.strip("/").replace("-", " ")
-    return s[:1].upper() + s[1:] if s else ""
+def _links_producto(raiz, base_url: str) -> list[str]:
+    urls = set()
+    for a in raiz.find_all("a", href=True):
+        href = a["href"].strip()
+        full = urljoin(base_url, href)
+        if _es_pewen(full) and PRODUCT_LINK_RE.search(urlparse(full).path):
+            urls.add(full.split("?")[0].split("#")[0])
+    return sorted(urls)
+
+
+def scrapear_pagina_producto(url: str, categoria: str) -> dict[str, dict]:
+    soup = _fetch_soup(url)
+    if soup is None:
+        return {}
+    return _imgs_de_soup(_raiz_main(soup), url, categoria)
+
+
+def scrapear_categoria(path: str) -> dict[str, dict]:
+    """Scrapea la grid + todas las páginas de producto linkeadas desde ahí."""
+    url = urljoin(SITE_BASE, path)
+    soup = _fetch_soup(url)
+    if soup is None:
+        return {}
+    raiz = _raiz_main(soup)
+    categoria = _slug_a_nombre(path)
+
+    encontradas = _imgs_de_soup(raiz, url, categoria)
+    productos = _links_producto(raiz, url)
+    print(f"[scraper] {path} -> {len(encontradas)} en grid, {len(productos)} productos")
+
+    if productos:
+        with ThreadPoolExecutor(max_workers=WORKERS_PRODUCTOS) as ex:
+            futures = {ex.submit(scrapear_pagina_producto, p, categoria): p for p in productos}
+            for f in as_completed(futures):
+                try:
+                    extras = f.result()
+                except Exception as e:
+                    print(f"[scraper] producto fail: {e}", file=sys.stderr)
+                    continue
+                for k, v in extras.items():
+                    if k not in encontradas:
+                        encontradas[k] = v
+
+    return encontradas
 
 
 def scrapear_sitio(categorias: list[str] = None) -> list[dict]:
@@ -156,18 +207,20 @@ def scrapear_sitio(categorias: list[str] = None) -> list[dict]:
     todas: dict[str, dict] = {}
     for c in categorias:
         items = scrapear_categoria(c)
-        print(f"[scraper] {c} -> {len(items)} imágenes")
-        for it in items:
-            if it["url"] in todas:
-                if it["categoria"] not in todas[it["url"]]["categoria"]:
-                    todas[it["url"]]["categoria"] += f" / {it['categoria']}"
+        print(f"[scraper] {c} -> {len(items)} imágenes totales")
+        for url, row in items.items():
+            if url in todas:
+                if row["categoria"] not in todas[url]["categoria"]:
+                    todas[url]["categoria"] += f" / {row['categoria']}"
             else:
-                todas[it["url"]] = it
+                todas[url] = row
     return list(todas.values())
 
 
 if __name__ == "__main__":
-    items = scrapear_sitio()
+    import sys
+    cats = [sys.argv[1]] if len(sys.argv) > 1 else None
+    items = scrapear_sitio(cats)
     print(f"\nTotal único: {len(items)} imágenes")
-    for it in items[:5]:
+    for it in items[:8]:
         print(f"  · [{it['categoria']}] {it['url']}  alt={it['alt'][:40]!r}")
