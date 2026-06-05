@@ -393,46 +393,60 @@ for i in range(0, len(resultados), cols_per_row):
     cols = st.columns(cols_per_row)
     for col, foto in zip(cols, row):
         with col:
-            thumb_path = ROOT / foto["thumb_path"]
-            if thumb_path.exists():
-                st.image(str(thumb_path), use_container_width=True)
-            else:
-                st.write("(thumb no encontrado)")
-
-            color_chip = rgb_a_hex(foto["r"], foto["g"], foto["b"])
-            etiqueta = foto.get("name") or foto.get("alt") or foto.get("categoria") or "—"
-            st.markdown(
-                f"<div style='display:flex;align-items:center;gap:6px;font-size:12px'>"
-                f"<span style='display:inline-block;width:14px;height:14px;border-radius:3px;"
-                f"background:{color_chip};border:1px solid #ccc'></span>"
-                f"<span><b>{foto['tono']}</b> · {foto['source']}</span></div>",
-                unsafe_allow_html=True,
-            )
-            st.caption(etiqueta[:60])
-
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                marcado = foto["id"] in seleccion
-                if st.checkbox("✓", value=marcado, key=f"sel_{foto['id']}", label_visibility="collapsed"):
-                    seleccion.add(foto["id"])
+            with st.container(border=True):
+                thumb_path = ROOT / foto["thumb_path"]
+                if thumb_path.exists():
+                    st.image(str(thumb_path), use_container_width=True)
                 else:
-                    seleccion.discard(foto["id"])
-            with b2:
-                url_dl = foto.get("url_download") or foto.get("url_original")
-                if url_dl:
-                    st.link_button("⬇", url_dl, use_container_width=True)
-            with b3:
-                if modo_papelera:
-                    if st.button("↩", key=f"res_{foto['id']}", help="Restaurar",
-                                 use_container_width=True):
-                        set_hidden(foto["id"], 0)
-                        st.rerun()
-                else:
-                    if st.button("🗑", key=f"hide_{foto['id']}", help="Ocultar",
-                                 use_container_width=True):
-                        set_hidden(foto["id"], 1)
+                    st.write("(thumb no encontrado)")
+
+                color_chip = rgb_a_hex(foto["r"], foto["g"], foto["b"])
+                etiqueta = foto.get("name") or foto.get("alt") or foto.get("categoria") or "—"
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:6px;font-size:12px'>"
+                    f"<span style='display:inline-block;width:14px;height:14px;border-radius:3px;"
+                    f"background:{color_chip};border:1px solid #ccc'></span>"
+                    f"<span><b>{foto['tono']}</b> · {foto['source']}</span></div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(etiqueta[:60])
+
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    marcado = foto["id"] in seleccion
+                    if st.checkbox("✓", value=marcado, key=f"sel_{foto['id']}",
+                                   label_visibility="collapsed",
+                                   help="Agregar a la selección"):
+                        seleccion.add(foto["id"])
+                    else:
                         seleccion.discard(foto["id"])
-                        st.rerun()
+                with b2:
+                    url_dl = foto.get("url_download") or foto.get("url_original")
+                    if url_dl:
+                        st.link_button("⬇", url_dl, use_container_width=True,
+                                       help="Descargar esta foto")
+                with b3:
+                    if modo_papelera:
+                        if st.button("↩", key=f"res_{foto['id']}", help="Restaurar esta foto",
+                                     use_container_width=True):
+                            set_hidden(foto["id"], 0)
+                            st.rerun()
+                    else:
+                        with st.popover("🗑", use_container_width=True,
+                                        help="Ocultar esta foto"):
+                            if thumb_path.exists():
+                                st.image(str(thumb_path), use_container_width=True)
+                            st.markdown(f"**¿Ocultar esta foto?**")
+                            st.caption(etiqueta[:80])
+                            cc1, cc2 = st.columns(2)
+                            with cc1:
+                                if st.button("Sí, ocultar", key=f"confirm_hide_{foto['id']}",
+                                             type="primary", use_container_width=True):
+                                    set_hidden(foto["id"], 1)
+                                    seleccion.discard(foto["id"])
+                                    st.rerun()
+                            with cc2:
+                                st.caption("(cerrá el popover para cancelar)")
 
 if seleccion != get_seleccion():
     set_seleccion(seleccion)
