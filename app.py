@@ -19,6 +19,7 @@ import requests
 import streamlit as st
 
 from src.persistencia import esta_habilitada as persist_habilitada, persistir as persist_a_github
+from src.sincronizacion import disparar_reindex, ultima_corrida
 
 DB_PATH = Path(__file__).parent / "fotos.db"
 ROOT = Path(__file__).parent
@@ -312,6 +313,29 @@ with st.sidebar:
         color = st.color_picker("Color de referencia", "#c8a878")
         tol_h = st.slider("Tolerancia", 0.05, 0.8, 0.25, 0.05)
         color_target = hex_a_hsv(color)
+
+    st.divider()
+    with st.expander("🔄 Sincronizar con Drive y sitio"):
+        st.caption(
+            "Re-corre el indexador completo: busca fotos nuevas en el Drive y en el sitio. "
+            "Tarda ~25 min, corre en GitHub Actions. Cuando termina, la app se recarga sola."
+        )
+        run = ultima_corrida()
+        if run:
+            if run["status"] == "completed":
+                emoji = "✅" if run["conclusion"] == "success" else "❌"
+                st.caption(f"{emoji} Última corrida: {run['conclusion']} · {run['updated_at']}")
+            else:
+                st.caption(f"⏳ Corrida en curso ({run['status']})")
+            st.markdown(f"[Ver detalle en GitHub]({run['html_url']})")
+
+        if st.button("🔄 Actualizar ahora", use_container_width=True):
+            ok, msg = disparar_reindex()
+            if ok:
+                st.success("Re-indexado disparado. Avísanos en ~25 min cuando se recargue solo.")
+                st.markdown(f"[Ver progreso en GitHub Actions]({msg})")
+            else:
+                st.error(f"No pude disparar el workflow: {msg}")
 
     st.divider()
     if seleccion:
