@@ -6,10 +6,16 @@ en la query string así un asesor puede armar un set y mandarle la URL al client
 from __future__ import annotations
 
 import colorsys
+import io
 import math
+import re
 import sqlite3
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
+import requests
 import streamlit as st
 
 DB_PATH = Path(__file__).parent / "fotos.db"
@@ -104,6 +110,110 @@ def set_hidden(foto_id: str, value: int) -> None:
     conn.commit()
 
 
+def set_hidden_bulk(foto_ids: set[str], value: int) -> int:
+    conn = get_conn()
+    if conn is None or not foto_ids:
+        return 0
+    placeholders = ",".join("?" * len(foto_ids))
+    cur = conn.execute(
+        f"UPDATE fotos SET hidden = ? WHERE id IN ({placeholders})",
+        [value, *foto_ids],
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename(name: str, fallback: str, ext: str) -> str:
+    base = _SAFE_NAME_RE.sub("_", (name or fallback).strip()).strip("_")[:80] or fallback
+    if not ext.startswith("."):
+        ext = "." + ext
+    if base.lower().endswith(ext.lower()):
+        return base
+    return base + ext
+
+
+def _ext_de_url(url: str, default: str = ".jpg") -> str:
+    if not url:
+        return default
+    path = urlparse(url).path.lower()
+    for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
+        if path.endswith(ext):
+            return ext
+    return default
+
+
+def _filas_por_ids(foto_ids: set[str]) -> list[dict]:
+    conn = get_conn()
+    if conn is None or not foto_ids:
+        return []
+    placeholders = ",".join("?" * len(foto_ids))
+    cur = conn.execute(
+        f"SELECT id, source, name, thumb_path, url_download, url_original "
+        f"FROM fotos WHERE id IN ({placeholders})",
+        list(foto_ids),
+    )
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def zip_de_thumbs(foto_ids: set[str]) -> tuple[bytes, int]:
+    rows = _filas_por_ids(foto_ids)
+    buf = io.BytesIO()
+    n = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in rows:
+            full = ROOT / r["thumb_path"]
+            if not full.exists():
+                continue
+            arcname = _safe_filename(r["name"], r["id"], ".jpg")
+            zf.write(full, arcname=arcname)
+            n += 1
+    return buf.getvalue(), n
+
+
+def _bajar_uno(row: dict) -> tuple[str, bytes, str] | None:
+    url = row.get("url_download") or row.get("url_original")
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.content:
+            return None
+    except Exception:
+        return None
+    ext = _ext_de_url(row.get("url_original") or url)
+    arcname = _safe_filename(row["name"], row["id"], ext)
+    return (arcname, r.content, row["id"])
+
+
+def zip_de_originales(foto_ids: set[str], progress_cb=None) -> tuple[bytes, int]:
+    rows = _filas_por_ids(foto_ids)
+    if not rows:
+        return b"", 0
+    buf = io.BytesIO()
+    ok = 0
+    usados: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(_bajar_uno, r) for r in rows]
+            for i, f in enumerate(as_completed(futures), 1):
+                if progress_cb:
+                    progress_cb(i, len(rows))
+                res = f.result()
+                if res is None:
+                    continue
+                arcname, content, fid = res
+                if arcname in usados:
+                    arcname = f"{fid[:12]}_{arcname}"
+                usados.add(arcname)
+                zf.writestr(arcname, content)
+                ok += 1
+    return buf.getvalue(), ok
+
+
 def hex_a_hsv(hex_color: str) -> tuple[float, float, float]:
     hex_color = hex_color.lstrip("#")
     r = int(hex_color[0:2], 16) / 255
@@ -180,11 +290,64 @@ with st.sidebar:
     st.divider()
     if seleccion:
         st.subheader(f"🗂 Selección ({len(seleccion)})")
-        if st.button("Vaciar selección"):
-            set_seleccion(set())
-            st.rerun()
+
         st.text_input("Link compartible", value=f"?sel={','.join(sorted(seleccion))}", disabled=True)
         st.caption("Copialo y pasáselo a tu cliente.")
+
+        if st.button("📥 Descargar thumbs (rápido)", use_container_width=True):
+            with st.spinner("Armando ZIP de thumbs…"):
+                data, n = zip_de_thumbs(seleccion)
+            if n:
+                st.session_state["zip_thumbs"] = (data, n)
+            else:
+                st.warning("No pude armar el zip.")
+        if "zip_thumbs" in st.session_state:
+            data, n = st.session_state["zip_thumbs"]
+            st.download_button(
+                f"⬇️ Bajar zip ({n} fotos · {len(data)//1024} KB)",
+                data=data,
+                file_name="pewen_thumbs.zip",
+                mime="application/zip",
+                use_container_width=True,
+                on_click=lambda: st.session_state.pop("zip_thumbs", None),
+            )
+
+        if st.button("📦 Descargar originales (lento)", use_container_width=True):
+            prog = st.progress(0.0, text="Bajando originales…")
+            def cb(i, total):
+                prog.progress(i / max(total, 1), text=f"Bajando originales… {i}/{total}")
+            data, n = zip_de_originales(seleccion, progress_cb=cb)
+            prog.empty()
+            if n:
+                st.session_state["zip_orig"] = (data, n)
+            else:
+                st.warning("No pude bajar ningún original (¿perdiste conexión?).")
+        if "zip_orig" in st.session_state:
+            data, n = st.session_state["zip_orig"]
+            st.download_button(
+                f"⬇️ Bajar zip ({n} fotos · {len(data)//1024//1024} MB)",
+                data=data,
+                file_name="pewen_originales.zip",
+                mime="application/zip",
+                use_container_width=True,
+                on_click=lambda: st.session_state.pop("zip_orig", None),
+            )
+
+        confirma = st.checkbox(
+            "Confirmar ocultar las seleccionadas",
+            value=False,
+            help="Tildá esto y después tocá el botón rojo.",
+        )
+        if st.button("🗑 Ocultar todas las seleccionadas", type="primary",
+                     disabled=not confirma, use_container_width=True):
+            n = set_hidden_bulk(seleccion, 1)
+            set_seleccion(set())
+            st.success(f"{n} fotos ocultadas.")
+            st.rerun()
+
+        if st.button("Vaciar selección", use_container_width=True):
+            set_seleccion(set())
+            st.rerun()
 
 resultados = buscar(query, sources, categorias_sel, tonos_sel, color_target, tol_h, modo_papelera)
 
