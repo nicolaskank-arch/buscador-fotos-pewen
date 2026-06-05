@@ -32,7 +32,12 @@ def get_conn():
     if not DB_PATH.exists():
         return None
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError:
+        # Streamlit Cloud no siempre permite crear los archivos -shm/-wal del modo WAL.
+        # Caemos al journal default (DELETE), que para nuestro nivel de concurrencia alcanza.
+        pass
     return conn
 
 
