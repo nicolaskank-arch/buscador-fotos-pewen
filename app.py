@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 
+from src.persistencia import esta_habilitada as persist_habilitada, persistir as persist_a_github
+
 DB_PATH = Path(__file__).parent / "fotos.db"
 ROOT = Path(__file__).parent
 
@@ -108,6 +110,8 @@ def set_hidden(foto_id: str, value: int) -> None:
         return
     conn.execute("UPDATE fotos SET hidden = ? WHERE id = ?", (value, foto_id))
     conn.commit()
+    accion = "ocultada" if value else "restaurada"
+    _persist_async(f"app: 1 foto {accion}")
 
 
 def set_hidden_bulk(foto_ids: set[str], value: int) -> int:
@@ -120,7 +124,24 @@ def set_hidden_bulk(foto_ids: set[str], value: int) -> int:
         [value, *foto_ids],
     )
     conn.commit()
+    accion = "ocultadas" if value else "restauradas"
+    _persist_async(f"app: {cur.rowcount} fotos {accion}")
     return cur.rowcount
+
+
+def _persist_async(mensaje: str) -> None:
+    """Empuja la persistencia a un thread daemon para no bloquear el rerun."""
+    if not persist_habilitada():
+        return
+    import threading
+    t = threading.Thread(target=_persist_worker, args=(mensaje,), daemon=True)
+    t.start()
+
+
+def _persist_worker(mensaje: str) -> None:
+    ok, info = persist_a_github(mensaje)
+    if not ok:
+        print(f"[persistir] {info}")
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -261,6 +282,11 @@ seleccion = get_seleccion()
 st.divider()
 with st.sidebar:
     st.header("Filtros")
+
+    if persist_habilitada():
+        st.caption("✅ Modo persistente activo — los cambios se guardan en GitHub.")
+    else:
+        st.caption("⚠️ Modo efímero — los cambios se pierden al reiniciar el container.")
 
     modo_papelera = st.toggle(
         "🗂 Modo papelera",
