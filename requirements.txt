@@ -1,0 +1,8 @@
+streamlit>=1.31
+pillow>=10.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+gdown>=5.1
+colorthief>=0.2.1
+pandas>=2.0

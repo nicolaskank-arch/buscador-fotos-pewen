@@ -1,0 +1,41 @@
+name: Reindexar fotos
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"   # cada 12 hs
+  workflow_dispatch:           # botón manual
+
+permissions:
+  contents: write
+
+jobs:
+  indexar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar deps
+        run: pip install -r requirements.txt
+
+      - name: Correr indexador
+        run: python indexador.py
+        env:
+          PYTHONUNBUFFERED: "1"
+
+      - name: Commitear cambios
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fotos.db thumbs/ || true
+          if git diff --cached --quiet; then
+            echo "Sin cambios."
+          else
+            git commit -m "auto: reindexado $(date -u +%Y-%m-%d)"
+            git push
+          fi
