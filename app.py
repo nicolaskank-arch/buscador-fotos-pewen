@@ -57,16 +57,47 @@ def stats():
             "ocultas": ocultas, "tonos": tonos, "categorias": categorias}
 
 
-def _fts_query(raw: str) -> str:
-    """Convierte la query del usuario en una FTS5 query segura.
+# Equivalencias alemán ↔ español. Las fotos del Drive vienen con nombres
+# originales (Kronotex usa alemán): traducimos para que matchee con los
+# nombres en castellano del sitio. Bidireccional.
+SINONIMOS = {
+    "zement": ["cemento", "cementicio", "cement"],
+    "cement": ["cemento", "cementicio", "zement"],
+    "cemento": ["zement", "cementicio", "cement"],
+    "cementicio": ["zement", "cemento", "cement"],
+    "holz": ["madera"],
+    "madera": ["holz"],
+    "marmor": ["marmol", "mármol"],
+    "marmol": ["marmor"],
+    "mármol": ["marmor"],
+    "stein": ["piedra"],
+    "piedra": ["stein"],
+    "eiche": ["roble"],
+    "roble": ["eiche"],
+    "nussbaum": ["nogal"],
+    "nogal": ["nussbaum"],
+    "weiss": ["blanco"],
+    "weiß": ["blanco"],
+    "blanco": ["weiss", "weiß"],
+    "grau": ["gris"],
+    "gris": ["grau"],
+    "schwarz": ["negro"],
+    "negro": ["schwarz"],
+    "beige": ["sand"],
+    "sand": ["arena", "beige"],
+    "arena": ["sand"],
+    "dark": ["oscuro"],
+    "light": ["claro"],
+    "oscuro": ["dark"],
+    "claro": ["light"],
+}
 
-    FTS5 trata `-`, `"`, `(`, `:` como operadores. Si el usuario tipea "942-2"
-    el guión se interpreta como NOT y crashea. Solución: quotear cada token
-    como frase literal y agregar `*` para prefix match.
-    """
-    raw = raw.strip().replace('"', "").replace(":", " ").replace("(", " ").replace(")", " ")
-    tokens = [t for t in raw.split() if t]
-    return " ".join(f'"{t}"*' for t in tokens)
+
+def _tokens_y_sinonimos(palabra: str) -> list[str]:
+    p = palabra.lower().strip()
+    if not p:
+        return []
+    return [p, *SINONIMOS.get(p, [])]
 
 
 def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[str],
@@ -90,31 +121,25 @@ def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[st
         params.extend(tonos)
 
     if query.strip():
-        fts_q = _fts_query(query)
-        if fts_q:
-            try:
-                ids_fts = [r[0] for r in conn.execute(
-                    "SELECT id FROM fotos_fts WHERE fotos_fts MATCH ? LIMIT 2000",
-                    (fts_q,)
-                ).fetchall()]
-            except sqlite3.OperationalError:
-                # caracter raro que ni el quoting salvó — fallback a LIKE sobre name/alt
-                like_q = f"%{query.strip()}%"
-                ids_fts = [r[0] for r in conn.execute(
-                    "SELECT id FROM fotos WHERE name LIKE ? OR alt LIKE ? "
-                    "OR categoria LIKE ? LIMIT 2000",
-                    (like_q, like_q, like_q)
-                ).fetchall()]
-            if not ids_fts:
-                return []
-            where.append(f"id IN ({','.join('?' * len(ids_fts))})")
-            params.extend(ids_fts)
+        # Búsqueda substring (LIKE %tok%) con sinónimos alemán/español.
+        # Cada palabra del usuario debe matchear (AND), y cada palabra acepta
+        # cualquiera de sus sinónimos (OR).
+        palabras_usuario = [p for p in query.strip().lower().split() if p]
+        for palabra in palabras_usuario:
+            opciones = _tokens_y_sinonimos(palabra)
+            cond = []
+            for op in opciones:
+                like = f"%{op}%"
+                cond.append("(name LIKE ? OR alt LIKE ? OR categoria LIKE ?)")
+                params.extend([like, like, like])
+            where.append("(" + " OR ".join(cond) + ")")
 
     sql = "SELECT * FROM fotos"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " LIMIT ?"
-    params.append(limit * 4 if color_target_hsv else limit)
+    # SIN LIMIT en SQL: sino el orden por rowid hace que solo aparezcan
+    # las primeras 600 inserciones (todas Drive). Aplicamos el limit
+    # después de ordenar y mezclar.
 
     cur = conn.execute(sql, params)
     cols = [c[0] for c in cur.description]
@@ -128,9 +153,23 @@ def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[st
             dv = abs(r["v"] - tv)
             return math.sqrt(dh * dh * 4 + ds * ds + dv * dv)
         rows.sort(key=dist)
-        rows = [r for r in rows if dist(r) < tol_h][:limit]
+        rows = [r for r in rows if dist(r) < tol_h]
+    else:
+        # Intercalar drive y web para que ninguna fuente domine los primeros N
+        rows = _intercalar(rows)
 
-    return rows
+    return rows[:limit]
+
+
+def _intercalar(rows: list[dict]) -> list[dict]:
+    drive = [r for r in rows if r.get("source") == "drive"]
+    web = [r for r in rows if r.get("source") == "web"]
+    otros = [r for r in rows if r.get("source") not in ("drive", "web")]
+    out = []
+    for i in range(max(len(drive), len(web))):
+        if i < len(drive): out.append(drive[i])
+        if i < len(web): out.append(web[i])
+    return out + otros
 
 
 def set_hidden(foto_id: str, value: int) -> None:
