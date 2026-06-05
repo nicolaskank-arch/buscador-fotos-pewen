@@ -20,6 +20,8 @@ import streamlit as st
 
 from src.persistencia import esta_habilitada as persist_habilitada, persistir as persist_a_github
 from src.sincronizacion import disparar_reindex, ultima_corrida
+from src.drive_upload import esta_habilitada as upload_habilitado, listar_subcarpetas, subir_archivo
+from src.analyzer import procesar_bytes, hash_id
 
 DB_PATH = Path(__file__).parent / "fotos.db"
 ROOT = Path(__file__).parent
@@ -315,6 +317,76 @@ with st.sidebar:
         color_target = hex_a_hsv(color)
 
     st.divider()
+    with st.expander("📤 Subir fotos al Drive", expanded=False):
+        if not upload_habilitado():
+            st.caption("⚠️ Falta configurar la Service Account de Google. Pedile a Nicolás el setup (10 min).")
+        else:
+            subcarpetas = listar_subcarpetas()
+            destino = st.selectbox(
+                "Subcarpeta del Drive",
+                options=["(raíz)"] + subcarpetas + ["+ Crear nueva subcarpeta…"],
+                index=0,
+            )
+            nueva_carpeta = ""
+            if destino == "+ Crear nueva subcarpeta…":
+                nueva_carpeta = st.text_input("Nombre de la nueva subcarpeta", "")
+
+            archivos = st.file_uploader(
+                "Elegí una o más fotos",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=True,
+            )
+
+            if archivos and st.button("📤 Subir al Drive", type="primary", use_container_width=True):
+                conn = get_conn()
+                target = nueva_carpeta.strip() or (None if destino == "(raíz)" else destino)
+                prog = st.progress(0.0, text="Subiendo…")
+                ok_count = 0
+                fallidas = []
+                for i, f in enumerate(archivos, 1):
+                    prog.progress((i - 1) / len(archivos), text=f"Subiendo {f.name} ({i}/{len(archivos)})")
+                    try:
+                        content = f.getvalue()
+                        info = subir_archivo(content, f.name, mime=f.type or "image/jpeg",
+                                              subcarpeta=target)
+                        foto_id = hash_id("drive", info["id"])
+                        meta = procesar_bytes(content, foto_id)
+                        if meta:
+                            row = (
+                                foto_id, "drive", f.name, info.get("subcarpeta", ""),
+                                "", info["url_view"], info["url_view"], info["url_download"],
+                                meta["thumb_path"], meta["r"], meta["g"], meta["b"],
+                                meta["h"], meta["s"], meta["v"], meta["tono"],
+                                meta["width"], meta["height"],
+                                __import__("time").time(), 0,
+                            )
+                            conn.execute(
+                                "INSERT OR REPLACE INTO fotos "
+                                "(id, source, name, categoria, alt, url_original, url_view, "
+                                "url_download, thumb_path, r, g, b, h, s, v, tono, width, height, "
+                                "indexed_at, hidden) VALUES (" + ",".join(["?"] * 20) + ")",
+                                row,
+                            )
+                            conn.execute("DELETE FROM fotos_fts WHERE id = ?", (foto_id,))
+                            conn.execute(
+                                "INSERT INTO fotos_fts (id, name, alt, categoria) VALUES (?, ?, ?, ?)",
+                                (foto_id, f.name, "", info.get("subcarpeta", "")),
+                            )
+                            ok_count += 1
+                        else:
+                            fallidas.append(f.name)
+                    except Exception as e:
+                        fallidas.append(f"{f.name} ({e})")
+                conn.commit()
+                prog.empty()
+                if ok_count:
+                    st.success(f"✅ {ok_count} foto(s) subidas al Drive y al buscador.")
+                    _persist_async(f"app: {ok_count} fotos subidas")
+                if fallidas:
+                    st.error(f"❌ Fallaron: {fallidas}")
+                if ok_count:
+                    st.rerun()
+
     with st.expander("🔄 Sincronizar con Drive y sitio"):
         st.caption(
             "Re-corre el indexador completo: busca fotos nuevas en el Drive y en el sitio. "
