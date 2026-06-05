@@ -6,5 +6,3 @@ lxml>=5.0
 gdown>=5.1
 colorthief>=0.2.1
 pandas>=2.0
-google-api-python-client>=2.100
-google-auth>=2.25

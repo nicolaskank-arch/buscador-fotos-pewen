@@ -102,27 +102,17 @@ def procesar(url_o_path: str, foto_id: str) -> dict | None:
             img = ImageOps.exif_transpose(Image.open(url_o_path)).convert("RGB")
         except Exception:
             img = None
-    return _finalizar(img, foto_id)
-
-
-def procesar_bytes(content: bytes, foto_id: str) -> dict | None:
-    """Versión cuando ya tenés los bytes (ej: file_uploader). Salta la descarga."""
-    try:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(content))).convert("RGB")
-    except Exception:
-        return None
-    return _finalizar(img, foto_id)
-
-
-def _finalizar(img: Image.Image | None, foto_id: str) -> dict | None:
     if img is None:
         return None
+
     thumb_path = THUMBS_DIR / f"{foto_id}.jpg"
     if not generar_thumb(img, thumb_path):
         return None
+
     rgb = color_dominante(img)
     hsv = rgb_a_hsv(rgb)
     tono = nombre_tono(hsv)
+
     return {
         "thumb_path": str(thumb_path.relative_to(THUMBS_DIR.parent)).replace("\\", "/"),
         "r": rgb[0], "g": rgb[1], "b": rgb[2],
