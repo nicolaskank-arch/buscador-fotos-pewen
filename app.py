@@ -404,6 +404,45 @@ with st.sidebar:
             else:
                 st.error(f"No pude disparar el workflow: {msg}")
 
+        with st.expander("🔧 Diagnóstico del PAT"):
+            import os as _os
+            try:
+                _pat = st.secrets.get("github_pat")
+            except Exception as _e:
+                _pat = None
+                st.write(f"Error leyendo secret: {_e}")
+            if not _pat:
+                st.write("❌ No hay `github_pat` en secrets.")
+            else:
+                _pat = str(_pat)
+                st.write(f"- **Largo:** {len(_pat)} caracteres")
+                st.write(f"- **Empieza con:** `{_pat[:14]}…`")
+                st.write(f"- **Termina con:** `…{_pat[-4:]}`")
+                _strip = _pat.strip()
+                if _strip != _pat:
+                    st.write(f"⚠️ Tiene espacios o newlines: largo sin trim = {len(_strip)}")
+                else:
+                    st.write("✓ Sin espacios al inicio/fin.")
+                if not _pat.startswith("github_pat_"):
+                    st.write("⚠️ NO empieza con `github_pat_` — probablemente está corrupto o es de otro tipo.")
+                else:
+                    st.write("✓ Formato fine-grained correcto.")
+                # Probar el PAT contra /user (endpoint mínimo, solo confirma que es válido)
+                try:
+                    _test = requests.get(
+                        "https://api.github.com/user",
+                        headers={"Authorization": f"Bearer {_pat}",
+                                 "Accept": "application/vnd.github+json"},
+                        timeout=10,
+                    )
+                    if _test.status_code == 200:
+                        st.write(f"✅ El PAT funciona. Usuario: `{_test.json().get('login')}`")
+                    else:
+                        st.write(f"❌ El PAT NO es válido contra GitHub: HTTP {_test.status_code}")
+                        st.write(f"`{_test.text[:200]}`")
+                except Exception as _e:
+                    st.write(f"⚠️ Error probando el PAT: {_e}")
+
     st.divider()
     if seleccion:
         st.subheader(f"🗂 Selección ({len(seleccion)})")
