@@ -45,16 +45,18 @@ CREATE TABLE IF NOT EXISTS fotos (
     tono        TEXT,
     width       INTEGER,
     height      INTEGER,
-    indexed_at  REAL
+    indexed_at  REAL,
+    hidden      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tono ON fotos(tono);
 CREATE INDEX IF NOT EXISTS idx_source ON fotos(source);
 CREATE INDEX IF NOT EXISTS idx_categoria ON fotos(categoria);
+CREATE INDEX IF NOT EXISTS idx_hidden ON fotos(hidden);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS fotos_fts USING fts5(
     id UNINDEXED,
     name, alt, categoria,
-    content='', tokenize='unicode61'
+    tokenize='unicode61'
 );
 """
 
@@ -64,14 +66,22 @@ def init_db(rebuild: bool = False) -> sqlite3.Connection:
         DB_PATH.unlink()
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fotos)").fetchall()}
+    if "hidden" not in cols:
+        conn.execute("ALTER TABLE fotos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hidden ON fotos(hidden)")
+        conn.commit()
     return conn
 
 
 def upsert_foto(conn: sqlite3.Connection, row: dict) -> None:
-    cols = ", ".join(row.keys())
-    placeholders = ", ".join(["?"] * len(row))
+    cols = list(row.keys())
+    placeholders = ", ".join(["?"] * len(cols))
+    cols_sql = ", ".join(cols)
+    update_sql = ", ".join(f"{c}=excluded.{c}" for c in cols if c not in ("id", "hidden"))
     conn.execute(
-        f"INSERT OR REPLACE INTO fotos ({cols}) VALUES ({placeholders})",
+        f"INSERT INTO fotos ({cols_sql}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {update_sql}",
         list(row.values()),
     )
     conn.execute("DELETE FROM fotos_fts WHERE id = ?", (row["id"],))

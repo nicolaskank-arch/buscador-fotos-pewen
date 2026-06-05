@@ -22,34 +22,35 @@ st.set_page_config(page_title="Buscador de Fotos Pewen", layout="wide", page_ico
 def get_conn():
     if not DB_PATH.exists():
         return None
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
-@st.cache_data(ttl=300)
 def stats():
     conn = get_conn()
     if conn is None:
-        return {"total": 0, "drive": 0, "web": 0, "tonos": []}
-    cur = conn.execute("SELECT source, COUNT(*) FROM fotos GROUP BY source")
+        return {"total": 0, "drive": 0, "web": 0, "ocultas": 0, "tonos": [], "categorias": []}
+    cur = conn.execute("SELECT source, COUNT(*) FROM fotos WHERE hidden = 0 GROUP BY source")
     por_source = dict(cur.fetchall())
-    cur = conn.execute("SELECT DISTINCT tono FROM fotos WHERE tono IS NOT NULL ORDER BY tono")
-    tonos = [r[0] for r in cur.fetchall()]
-    cur = conn.execute("SELECT DISTINCT categoria FROM fotos WHERE categoria != '' ORDER BY categoria")
-    categorias = [r[0] for r in cur.fetchall()]
+    ocultas = conn.execute("SELECT COUNT(*) FROM fotos WHERE hidden = 1").fetchone()[0]
+    tonos = [r[0] for r in conn.execute(
+        "SELECT DISTINCT tono FROM fotos WHERE tono IS NOT NULL ORDER BY tono").fetchall()]
+    categorias = [r[0] for r in conn.execute(
+        "SELECT DISTINCT categoria FROM fotos WHERE categoria != '' ORDER BY categoria").fetchall()]
     total = sum(por_source.values())
     return {"total": total, "drive": por_source.get("drive", 0), "web": por_source.get("web", 0),
-            "tonos": tonos, "categorias": categorias}
+            "ocultas": ocultas, "tonos": tonos, "categorias": categorias}
 
 
 def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[str],
            color_target_hsv: tuple[float, float, float] | None,
-           tol_h: float, limit: int = 600) -> list[dict]:
+           tol_h: float, modo_papelera: bool, limit: int = 600) -> list[dict]:
     conn = get_conn()
     if conn is None:
         return []
 
-    where = []
+    where = [f"hidden = {1 if modo_papelera else 0}"]
     params: list = []
 
     if sources:
@@ -95,6 +96,14 @@ def buscar(query: str, sources: list[str], categorias: list[str], tonos: list[st
     return rows
 
 
+def set_hidden(foto_id: str, value: int) -> None:
+    conn = get_conn()
+    if conn is None:
+        return
+    conn.execute("UPDATE fotos SET hidden = ? WHERE id = ?", (value, foto_id))
+    conn.commit()
+
+
 def hex_a_hsv(hex_color: str) -> tuple[float, float, float]:
     hex_color = hex_color.lstrip("#")
     r = int(hex_color[0:2], 16) / 255
@@ -127,20 +136,27 @@ def set_seleccion(ids: set[str]) -> None:
 st.title("🏠 Buscador de Fotos Pewen")
 
 s = stats()
-if s["total"] == 0:
+if s["total"] == 0 and s["ocultas"] == 0:
     st.warning("La base de datos está vacía. Corré `python indexador.py` para indexar las fotos.")
     st.stop()
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Fotos totales", s["total"])
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Fotos visibles", s["total"])
 c2.metric("Del Drive", s["drive"])
 c3.metric("Del sitio web", s["web"])
+c4.metric("Ocultas", s["ocultas"])
 
 seleccion = get_seleccion()
 
 st.divider()
 with st.sidebar:
     st.header("Filtros")
+
+    modo_papelera = st.toggle(
+        "🗂 Modo papelera",
+        value=False,
+        help="Mostrar solo las fotos ocultas para poder restaurarlas.",
+    )
 
     query = st.text_input("🔎 Buscar (nombre / alt / categoría)", placeholder="ej: porcelanato roble")
 
@@ -167,14 +183,19 @@ with st.sidebar:
         if st.button("Vaciar selección"):
             set_seleccion(set())
             st.rerun()
-        link = st.text_input("Link compartible", value=f"?sel={','.join(sorted(seleccion))}", disabled=True)
+        st.text_input("Link compartible", value=f"?sel={','.join(sorted(seleccion))}", disabled=True)
         st.caption("Copialo y pasáselo a tu cliente.")
 
-resultados = buscar(query, sources, categorias_sel, tonos_sel, color_target, tol_h)
-st.caption(f"{len(resultados)} resultados")
+resultados = buscar(query, sources, categorias_sel, tonos_sel, color_target, tol_h, modo_papelera)
+
+if modo_papelera:
+    st.caption(f"🗂 Modo papelera · {len(resultados)} fotos ocultas")
+else:
+    st.caption(f"{len(resultados)} resultados")
 
 if not resultados:
-    st.info("No encontré fotos con esos filtros.")
+    st.info("No encontré fotos con esos filtros." if not modo_papelera
+            else "No hay fotos ocultas.")
     st.stop()
 
 cols_per_row = 4
@@ -200,7 +221,7 @@ for i in range(0, len(resultados), cols_per_row):
             )
             st.caption(etiqueta[:60])
 
-            b1, b2 = st.columns(2)
+            b1, b2, b3 = st.columns(3)
             with b1:
                 marcado = foto["id"] in seleccion
                 if st.checkbox("✓", value=marcado, key=f"sel_{foto['id']}", label_visibility="collapsed"):
@@ -211,7 +232,18 @@ for i in range(0, len(resultados), cols_per_row):
                 url_dl = foto.get("url_download") or foto.get("url_original")
                 if url_dl:
                     st.link_button("⬇", url_dl, use_container_width=True)
+            with b3:
+                if modo_papelera:
+                    if st.button("↩", key=f"res_{foto['id']}", help="Restaurar",
+                                 use_container_width=True):
+                        set_hidden(foto["id"], 0)
+                        st.rerun()
+                else:
+                    if st.button("🗑", key=f"hide_{foto['id']}", help="Ocultar",
+                                 use_container_width=True):
+                        set_hidden(foto["id"], 1)
+                        seleccion.discard(foto["id"])
+                        st.rerun()
 
-# Persistir la selección actualizada en la query string
 if seleccion != get_seleccion():
     set_seleccion(seleccion)
