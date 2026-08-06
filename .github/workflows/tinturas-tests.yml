@@ -1,0 +1,28 @@
+name: Tests tinturas
+
+# Acotado a tinturas-stock/: no se dispara por cambios del buscador de fotos.
+# Cuando la carpeta pase a su propio repo, el workflow que vale es el que ya
+# vive en tinturas-stock/.github/workflows/tests.yml y este se puede borrar.
+on:
+  push:
+    paths: ["tinturas-stock/**", ".github/workflows/tinturas-tests.yml"]
+  pull_request:
+    paths: ["tinturas-stock/**", ".github/workflows/tinturas-tests.yml"]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tinturas-stock
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Correr tests
+        run: pytest -q
